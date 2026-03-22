@@ -233,13 +233,7 @@ class PDFViewer(Viewer, QScrollArea):
             page_number: Zero-based page index.
             pixmap: The rendered page image.
         """
-        if page_number < 0 or page_number >= len(self._labels):
-            return
-        self._cache[page_number] = pixmap
-        label = self._labels[page_number]
-        label.setPixmap(pixmap)
-        label.setMinimumHeight(pixmap.height())
-        label.setText("")
+        self._apply_pixmap(page_number, pixmap)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         """Handle scroll events to trigger lazy loading.
@@ -251,11 +245,12 @@ class PDFViewer(Viewer, QScrollArea):
         super().scrollContentsBy(dx, dy)
         self._request_visible_pages()
 
-    def _request_visible_pages(self) -> None:
-        """Request rendering for visible pages and evict off-screen ones."""
-        if self._doc is None or self._worker is None:
-            return
+    def _get_visible_range(self) -> tuple[int, int]:
+        """Return (start, end) indices of pages near the viewport.
 
+        Returns:
+            A tuple of (start, end) where start is inclusive and end is exclusive.
+        """
         viewport_height = self.viewport().height()
         scroll_pos = self.verticalScrollBar().value()
 
@@ -273,11 +268,52 @@ class PDFViewer(Viewer, QScrollArea):
 
             visible.add(i)
 
-        start = max(0, min(visible) - self.CACHE_BEHIND) if visible else 0
-        end = min(
-            len(self._labels),
-            (max(visible) + self.CACHE_AHEAD + 1) if visible else 0,
-        )
+        if not visible:
+            return (0, 0)
+
+        start = max(0, min(visible) - self.CACHE_BEHIND)
+        end = min(len(self._labels), max(visible) + self.CACHE_AHEAD + 1)
+        return (start, end)
+
+    def _render_page_sync(self, page_number: int) -> QPixmap | None:
+        """Render a single page synchronously at the current zoom.
+
+        Args:
+            page_number: Zero-based page index.
+
+        Returns:
+            A QPixmap if successful, or None on error.
+        """
+        if self._doc is None:
+            return None
+        try:
+            img_bytes = self._doc.render_page(page_number, zoom=self._zoom)
+            image = QImage.fromData(img_bytes, "PNG")
+            return QPixmap.fromImage(image)
+        except Exception:
+            return None
+
+    def _apply_pixmap(self, page_number: int, pixmap: QPixmap) -> None:
+        """Apply a rendered pixmap to the corresponding label.
+
+        Args:
+            page_number: Zero-based page index.
+            pixmap: The rendered page image.
+        """
+        if page_number < 0 or page_number >= len(self._labels):
+            return
+        self._cache[page_number] = pixmap
+        label = self._labels[page_number]
+        label.setPixmap(pixmap)
+        label.setMinimumHeight(pixmap.height())
+        label.setText("")
+
+    def _request_visible_pages(self) -> None:
+        """Request rendering for visible pages and evict off-screen ones."""
+        if self._doc is None or self._worker is None:
+            return
+
+        start, end = self._get_visible_range()
 
         for i in range(start, end):
             if i not in self._cache:
@@ -288,16 +324,49 @@ class PDFViewer(Viewer, QScrollArea):
             del self._cache[k]
 
     def set_zoom(self, zoom: float) -> None:
-        """Set the zoom factor and re-render all pages.
+        """Set the zoom factor and re-render all pages atomically.
+
+        Pages in the viewport are rendered synchronously so that both
+        label sizes and pixmaps change on the same frame, eliminating
+        the visual "separate then rejoin" bounce.
 
         Args:
             zoom: New zoom factor (1.0 = 100%).
         """
+        if self._doc is None or not self._labels:
+            self._zoom = zoom
+            return
+
+        # Phase 1: determine which pages are currently visible.
+        vis_start, vis_end = self._get_visible_range()
+
+        # Phase 2: update zoom and pre-compute new label heights.
         self._zoom = zoom
+        self._update_label_sizes()
+
+        # Phase 3: clear old state and render visible pages synchronously.
         self._cache.clear()
-        if self._doc is not None:
-            self._cleanup_worker()
-            self._start_worker()
+        for i in range(vis_start, min(vis_end, len(self._labels))):
+            pixmap = self._render_page_sync(i)
+            if pixmap is not None:
+                self._apply_pixmap(i, pixmap)
+
+        # Phase 4: start background worker for remaining pages.
+        self._cleanup_worker()
+        self._start_worker()
+
+    def _update_label_sizes(self) -> None:
+        """Pre-compute and set expected label heights at current zoom.
+
+        Prevents layout bounce during zoom by giving every label its
+        final height before the background renderer produces pixmaps.
+        """
+        if self._doc is None:
+            return
+        for i, label in enumerate(self._labels):
+            if i < self._doc.page_count:
+                page = self._doc.get_page(i)
+                label.setMinimumHeight(int(page.height * self._zoom))
 
     @property
     def zoom(self) -> float:

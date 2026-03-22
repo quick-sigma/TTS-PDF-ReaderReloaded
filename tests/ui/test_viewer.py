@@ -106,6 +106,64 @@ class TestPDFViewer:
         viewer.set_zoom(2.0)
         assert viewer.zoom == 2.0
 
+    def test_set_zoom_updates_label_sizes_immediately(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """set_zoom should set label heights to expected values before worker starts.
+
+        Without this, labels retain heights from the previous zoom level and
+        each re-render shifts the layout, causing a visible bounce.
+        """
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+
+        # Labels start at placeholder 200px
+        for label in viewer._labels:
+            assert label.minimumHeight() >= 200
+
+        # Zoom to 2.0 — labels should immediately get correct heights
+        viewer.set_zoom(2.0)
+        for i, label in enumerate(viewer._labels):
+            page = viewer._doc.get_page(i)
+            expected = int(page.height * 2.0)
+            assert label.minimumHeight() == expected, (
+                f"Label {i}: expected height {expected} but got {label.minimumHeight()}"
+            )
+
+        viewer.close()
+
+    def test_set_zoom_renders_visible_pages_sync(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """set_zoom should render visible pages synchronously.
+
+        After zooming, pages in the viewport must already have pixmaps
+        at the new zoom so that label sizes and images change on the
+        same frame, eliminating the 'separate then rejoin' visual artifact.
+        """
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+
+        # Force viewport to be large enough to see at least page 0
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        old_zoom = viewer.zoom
+        viewer.set_zoom(old_zoom + 0.5)
+
+        # Page 0 is always visible initially — it should be cached immediately
+        assert 0 in viewer._cache, "Page 0 should be in cache after set_zoom"
+
+        # The cached pixmap must be at the new zoom, not the old one
+        pixmap = viewer._cache[0]
+        page = viewer._doc.get_page(0)
+        expected_height = int(page.height * viewer.zoom)
+        assert pixmap.height() == expected_height, (
+            f"Pixmap height {pixmap.height()} != expected {expected_height}"
+        )
+
+        viewer.close()
+
     def test_pdf_viewer_has_no_document_initially(self, qapp: QApplication) -> None:
         """Viewer should have no document before loading."""
         viewer = PDFViewer()
