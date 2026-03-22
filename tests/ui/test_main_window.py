@@ -5,10 +5,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMenu
 from PyQt6.QtGui import QKeyEvent
 
 from main import MainWindow
+from pdfreader_reborn.strings import t
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +65,7 @@ class TestMainWindowInit:
         """MainWindow should have a navigation toolbar."""
         window = MainWindow()
         qtoolbar = window._nav_toolbar.to_qtoolbar()
-        assert qtoolbar.windowTitle() == "Navigation"
+        assert qtoolbar.windowTitle() == t("toolbar.navigation.name")
         assert len(qtoolbar.actions()) == 3  # Open PDF + Zoom In + Zoom Out
 
 
@@ -198,7 +199,7 @@ class TestMainWindowPluginToolbar:
         window = MainWindow()
         qtoolbar = window._nav_toolbar.to_qtoolbar()
         first_action = qtoolbar.actions()[0]
-        assert first_action.text() == "Open PDF"
+        assert first_action.text() == t("toolbar.open.label")
         assert "Ctrl+O" in first_action.toolTip()
 
     def test_toolbar_order_plugin_buttons_before_zoom(self, qapp: QApplication) -> None:
@@ -206,10 +207,12 @@ class TestMainWindowPluginToolbar:
         window = MainWindow()
         qtoolbar = window._nav_toolbar.to_qtoolbar()
         labels = [a.text() for a in qtoolbar.actions()]
-        assert labels[0] == "Open PDF"
-        assert "Zoom In" in labels
-        assert "Zoom Out" in labels
-        assert labels.index("Open PDF") < labels.index("Zoom In")
+        assert labels[0] == t("toolbar.open.label")
+        assert t("toolbar.zoom_in.label") in labels
+        assert t("toolbar.zoom_out.label") in labels
+        assert labels.index(t("toolbar.open.label")) < labels.index(
+            t("toolbar.zoom_in.label")
+        )
 
     def test_open_file_button_opens_document(
         self, qapp: QApplication, sample_pdf: Path
@@ -218,7 +221,7 @@ class TestMainWindowPluginToolbar:
         window = MainWindow()
         qtoolbar = window._nav_toolbar.to_qtoolbar()
         open_action = qtoolbar.actions()[0]
-        assert open_action.text() == "Open PDF"
+        assert open_action.text() == t("toolbar.open.label")
 
         with patch(
             "main.QFileDialog.getOpenFileName",
@@ -240,3 +243,114 @@ class TestMainWindowPluginToolbar:
             open_action.trigger()
 
         assert window.viewer._doc is None
+
+
+class TestMainWindowMenu:
+    """Tests for the menu bar structure."""
+
+    def test_menu_bar_exists(self, qapp: QApplication) -> None:
+        """MainWindow should have a menu bar."""
+        window = MainWindow()
+        menubar = window.menuBar()
+        assert menubar is not None
+
+    def test_has_file_menu(self, qapp: QApplication) -> None:
+        """Menu bar should have a File menu."""
+        window = MainWindow()
+        menu_titles = [m.title() for m in window.menuBar().findChildren(QMenu)]
+        assert t("menu.file") in menu_titles
+
+    def test_has_view_menu(self, qapp: QApplication) -> None:
+        """Menu bar should have a View menu."""
+        window = MainWindow()
+        menu_titles = [m.title() for m in window.menuBar().findChildren(QMenu)]
+        assert t("menu.view") in menu_titles
+
+    def test_has_settings_menu(self, qapp: QApplication) -> None:
+        """Menu bar should have a Settings menu."""
+        window = MainWindow()
+        menu_titles = [m.title() for m in window.menuBar().findChildren(QMenu)]
+        assert t("menu.settings") in menu_titles
+
+    def test_file_menu_has_open_action(self, qapp: QApplication) -> None:
+        """File menu should contain an Open file action."""
+        window = MainWindow()
+        file_menu = window.menuBar().findChildren(QMenu)[0]
+        action_texts = [a.text() for a in file_menu.actions()]
+        assert t("menu.file.open") in action_texts
+
+    def test_view_menu_has_zoom_actions(self, qapp: QApplication) -> None:
+        """View menu should contain zoom in and zoom out actions."""
+        window = MainWindow()
+        view_menu = window.menuBar().findChildren(QMenu)[1]
+        action_texts = [a.text() for a in view_menu.actions()]
+        assert t("menu.view.zoom_in") in action_texts
+        assert t("menu.view.zoom_out") in action_texts
+
+    def test_settings_menu_has_language_submenu(self, qapp: QApplication) -> None:
+        """Settings menu should contain a Language submenu."""
+        window = MainWindow()
+        settings_menu = window.menuBar().findChildren(QMenu)[2]
+        submenus = settings_menu.findChildren(QMenu)
+        submenu_titles = [m.title() for m in submenus]
+        assert t("menu.settings.language") in submenu_titles
+
+    def test_language_submenu_has_es_and_en(self, qapp: QApplication) -> None:
+        """Language submenu should have Spanish and English options."""
+        window = MainWindow()
+        lang_menu = window._lang_menu
+        lang_texts = [a.text() for a in lang_menu.actions()]
+        assert t("lang.es") in lang_texts
+        assert t("lang.en") in lang_texts
+
+    def test_open_action_triggers_open_file(self, qapp: QApplication) -> None:
+        """Open file menu action should emit the open_file signal."""
+        window = MainWindow()
+        callback = Mock()
+        window.signals.open_file.connect(callback)
+
+        file_menu = window.menuBar().findChildren(QMenu)[0]
+        open_action = None
+        for a in file_menu.actions():
+            if a.text() == t("menu.file.open"):
+                open_action = a
+                break
+        assert open_action is not None
+        with patch("main.QFileDialog.getOpenFileName", return_value=("", "")):
+            open_action.trigger()
+        callback.assert_called_once()
+
+    def test_zoom_in_action_triggers_zoom(self, qapp: QApplication) -> None:
+        """Zoom In menu action should emit the zoom_in signal."""
+        window = MainWindow()
+        callback = Mock()
+        window.signals.zoom_in.connect(callback)
+
+        view_menu = window.menuBar().findChildren(QMenu)[1]
+        zoom_in_action = None
+        for a in view_menu.actions():
+            if a.text() == t("menu.view.zoom_in"):
+                zoom_in_action = a
+                break
+        assert zoom_in_action is not None
+        zoom_in_action.trigger()
+        callback.assert_called_once()
+
+
+class TestMainWindowMenuRetranslation:
+    """Tests that menu text updates when locale changes."""
+
+    def test_menu_updates_on_locale_change(self, qapp: QApplication) -> None:
+        """Switching locale should retranslate all menu text."""
+        from pdfreader_reborn.strings import set_locale
+
+        window = MainWindow()
+        set_locale("en")
+
+        menu_titles = [m.title() for m in window.menuBar().findChildren(QMenu)]
+        assert "File" in menu_titles
+        assert "View" in menu_titles
+        assert "Settings" in menu_titles
+
+        # Restore to default
+        set_locale("es")

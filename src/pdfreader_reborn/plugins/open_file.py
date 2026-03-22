@@ -5,6 +5,7 @@ import pluggy
 
 from pdfreader_reborn.ui.button import Button
 from pdfreader_reborn.ui.icon import SVGIcon
+from pdfreader_reborn.strings import t
 
 hookimpl = pluggy.HookimplMarker("pdfreader_reborn")
 
@@ -46,8 +47,8 @@ class OpenFilePlugin:
         return [
             Button(
                 icon=SVGIcon(icons_dir / "openFile.svg"),
-                label="Open PDF",
-                tooltip="Open PDF file (Ctrl+O)",
+                label=t("toolbar.open.label"),
+                tooltip=t("toolbar.open.tooltip"),
                 on_click=self._on_open,
             ),
         ]

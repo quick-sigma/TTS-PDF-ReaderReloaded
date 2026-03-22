@@ -26,6 +26,8 @@ def test_new_architecture_modules_importable() -> None:
     from pdfreader_reborn.kernel import Kernel
     from pdfreader_reborn.kernel.hooks import ToolbarHooks
     from pdfreader_reborn.plugins import OpenFilePlugin
+    from pdfreader_reborn.cache import PageAdapter, PageCacheLRU
+    from pdfreader_reborn.strings import t, set_locale, get_locale
 
     assert Icon is not None
     assert SVGIcon is not None
@@ -41,3 +43,8 @@ def test_new_architecture_modules_importable() -> None:
     assert Kernel is not None
     assert ToolbarHooks is not None
     assert OpenFilePlugin is not None
+    assert PageAdapter is not None
+    assert PageCacheLRU is not None
+    assert t is not None
+    assert set_locale is not None
+    assert get_locale is not None

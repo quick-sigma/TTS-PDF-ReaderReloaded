@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QApplication, QToolBar
 from pdfreader_reborn.ui.icon import SVGIcon
 from pdfreader_reborn.ui.button import Button
 from pdfreader_reborn.ui.toolbar import Toolbar, NavigationToolbar
+from pdfreader_reborn.strings import t
 
 
 @pytest.fixture(scope="module")
@@ -42,8 +43,8 @@ class TestNavigationToolbar:
         toolbar = NavigationToolbar(icons_dir)
         elements = list(toolbar)
         labels = [e.label for e in elements]
-        assert "Zoom In" in labels
-        assert "Zoom Out" in labels
+        assert t("toolbar.zoom_in.label") in labels
+        assert t("toolbar.zoom_out.label") in labels
 
     def test_navigation_toolbar_creates_qtoolbar(
         self, icons_dir: Path, qapp: QApplication
@@ -88,14 +89,14 @@ class TestNavigationToolbar:
         """Head should be the Zoom In button."""
         toolbar = NavigationToolbar(icons_dir)
         assert toolbar.head is not None
-        assert toolbar.head.label == "Zoom In"
+        assert toolbar.head.label == t("toolbar.zoom_in.label")
 
     def test_navigation_toolbar_linked_list_order(self, icons_dir: Path) -> None:
         """Elements should be linked in insertion order."""
         toolbar = NavigationToolbar(icons_dir)
         elements = list(toolbar)
         labels = [e.label for e in elements]
-        assert labels == ["Zoom In", "Zoom Out"]
+        assert labels == [t("toolbar.zoom_in.label"), t("toolbar.zoom_out.label")]
 
     def test_navigation_toolbar_add_element(self, icons_dir: Path) -> None:
         """Adding an element appends it to the linked list."""

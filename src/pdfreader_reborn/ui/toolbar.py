@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QToolBar
 
 from pdfreader_reborn.ui.icon import SVGIcon
 from pdfreader_reborn.ui.button import Button, ToolbarElement
+from pdfreader_reborn.strings import t
 
 
 class Toolbar(ABC):
@@ -161,14 +162,14 @@ class NavigationToolbar(Toolbar):
         """Construct toolbar elements. No shortcuts — KeyboardManager owns those."""
         zoom_in_btn = Button(
             icon=SVGIcon(self._icons_dir / "zoomIn.svg"),
-            label="Zoom In",
-            tooltip="Zoom in (Ctrl+=)",
+            label=t("toolbar.zoom_in.label"),
+            tooltip=t("toolbar.zoom_in.tooltip"),
             on_click=self._on_zoom_in,
         )
         zoom_out_btn = Button(
             icon=SVGIcon(self._icons_dir / "zoomOut.svg"),
-            label="Zoom Out",
-            tooltip="Zoom out (Ctrl+-)",
+            label=t("toolbar.zoom_out.label"),
+            tooltip=t("toolbar.zoom_out.tooltip"),
             on_click=self._on_zoom_out,
         )
         self.add(zoom_in_btn)
@@ -180,7 +181,7 @@ class NavigationToolbar(Toolbar):
         Returns:
             A movable QToolBar with Open, Zoom In, and Zoom Out actions.
         """
-        toolbar = QToolBar("Navigation")
+        toolbar = QToolBar(t("toolbar.navigation.name"))
         toolbar.setMovable(True)
         self._actions: list = []
         for element in self:

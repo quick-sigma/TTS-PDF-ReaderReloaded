@@ -2,11 +2,13 @@
 
 import pytest
 from pathlib import Path
-from queue import Queue
 
+from PyQt6.QtCore import QPoint
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
-from pdfreader_reborn.ui.viewer import Viewer, PDFViewer, RenderWorker
+from pdfreader_reborn.ui.viewer import Viewer, PDFViewer
+from pdfreader_reborn.cache import PageCacheLRU
 
 
 @pytest.fixture(scope="session")
@@ -34,59 +36,6 @@ class TestViewer:
             viewer.close()
 
 
-class TestRenderWorker:
-    """Tests for the RenderWorker thread safety."""
-
-    def test_worker_uses_thread_safe_queue(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """RenderWorker should use queue.Queue, not list."""
-        from pdfreader_reborn.data.document import PdfDocument
-
-        doc = PdfDocument(sample_pdf)
-        worker = RenderWorker(doc, zoom=1.0)
-        assert isinstance(worker._queue, Queue)
-        doc.close()
-
-    def test_worker_deduplicates_requests(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """Requesting the same page twice should only queue it once."""
-        from pdfreader_reborn.data.document import PdfDocument
-
-        doc = PdfDocument(sample_pdf)
-        worker = RenderWorker(doc, zoom=1.0)
-        worker.request_page(0)
-        worker.request_page(0)
-        assert worker._queue.qsize() == 1
-        doc.close()
-
-    def test_worker_accepts_different_pages(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """Different page numbers should all be queued."""
-        from pdfreader_reborn.data.document import PdfDocument
-
-        doc = PdfDocument(sample_pdf)
-        worker = RenderWorker(doc, zoom=1.0)
-        worker.request_page(0)
-        worker.request_page(1)
-        worker.request_page(2)
-        assert worker._queue.qsize() == 3
-        doc.close()
-
-    def test_worker_stop_terminates(self, qapp: QApplication, sample_pdf: Path) -> None:
-        """stop() should terminate the worker thread."""
-        from pdfreader_reborn.data.document import PdfDocument
-
-        doc = PdfDocument(sample_pdf)
-        worker = RenderWorker(doc, zoom=1.0)
-        worker.start()
-        worker.stop()
-        assert not worker.isRunning()
-        doc.close()
-
-
 class TestPDFViewer:
     """Tests for the PDFViewer concrete implementation."""
 
@@ -105,64 +54,6 @@ class TestPDFViewer:
         viewer = PDFViewer()
         viewer.set_zoom(2.0)
         assert viewer.zoom == 2.0
-
-    def test_set_zoom_updates_label_sizes_immediately(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """set_zoom should set label heights to expected values before worker starts.
-
-        Without this, labels retain heights from the previous zoom level and
-        each re-render shifts the layout, causing a visible bounce.
-        """
-        viewer = PDFViewer()
-        viewer.load_document(sample_pdf)
-
-        # Labels start at placeholder 200px
-        for label in viewer._labels:
-            assert label.minimumHeight() >= 200
-
-        # Zoom to 2.0 — labels should immediately get correct heights
-        viewer.set_zoom(2.0)
-        for i, label in enumerate(viewer._labels):
-            page = viewer._doc.get_page(i)
-            expected = int(page.height * 2.0)
-            assert label.minimumHeight() == expected, (
-                f"Label {i}: expected height {expected} but got {label.minimumHeight()}"
-            )
-
-        viewer.close()
-
-    def test_set_zoom_renders_visible_pages_sync(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """set_zoom should render visible pages synchronously.
-
-        After zooming, pages in the viewport must already have pixmaps
-        at the new zoom so that label sizes and images change on the
-        same frame, eliminating the 'separate then rejoin' visual artifact.
-        """
-        viewer = PDFViewer()
-        viewer.load_document(sample_pdf)
-
-        # Force viewport to be large enough to see at least page 0
-        viewer.resize(800, 600)
-        qapp.processEvents()
-
-        old_zoom = viewer.zoom
-        viewer.set_zoom(old_zoom + 0.5)
-
-        # Page 0 is always visible initially — it should be cached immediately
-        assert 0 in viewer._cache, "Page 0 should be in cache after set_zoom"
-
-        # The cached pixmap must be at the new zoom, not the old one
-        pixmap = viewer._cache[0]
-        page = viewer._doc.get_page(0)
-        expected_height = int(page.height * viewer.zoom)
-        assert pixmap.height() == expected_height, (
-            f"Pixmap height {pixmap.height()} != expected {expected_height}"
-        )
-
-        viewer.close()
 
     def test_pdf_viewer_has_no_document_initially(self, qapp: QApplication) -> None:
         """Viewer should have no document before loading."""
@@ -186,6 +77,16 @@ class TestPDFViewerLoadDocument:
         assert viewer._doc.page_count == 3
         viewer.close()
 
+    def test_load_document_creates_lru_cache(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """load_document should create a PageCacheLRU."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        assert viewer._cache is not None
+        assert isinstance(viewer._cache, PageCacheLRU)
+        viewer.close()
+
     def test_load_document_creates_labels(
         self, qapp: QApplication, sample_pdf: Path
     ) -> None:
@@ -193,16 +94,6 @@ class TestPDFViewerLoadDocument:
         viewer = PDFViewer()
         viewer.load_document(sample_pdf)
         assert len(viewer._labels) == 3
-        viewer.close()
-
-    def test_load_document_starts_worker(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """load_document should create and start a render worker."""
-        viewer = PDFViewer()
-        viewer.load_document(sample_pdf)
-        assert viewer._worker is not None
-        assert viewer._worker.isRunning()
         viewer.close()
 
     def test_load_document_with_string_path(
@@ -215,25 +106,6 @@ class TestPDFViewerLoadDocument:
         assert viewer._doc.page_count == 3
         viewer.close()
 
-    def test_load_document_twice_replaces_previous(
-        self, qapp: QApplication, sample_pdf: Path
-    ) -> None:
-        """Loading a second document should clean up the first."""
-        viewer = PDFViewer()
-        viewer.load_document(sample_pdf)
-        first_worker = viewer._worker
-        first_doc = viewer._doc
-
-        viewer.load_document(sample_pdf)
-        # Worker is a new instance
-        assert viewer._worker is not first_worker
-        # Doc is a new instance
-        assert viewer._doc is not first_doc
-        # Still has correct page count
-        assert len(viewer._labels) == 3
-        # Labels are fresh QLabels (old ones were deleted)
-        viewer.close()
-
     def test_close_clears_doc(self, qapp: QApplication, sample_pdf: Path) -> None:
         """close() should set _doc to None."""
         viewer = PDFViewer()
@@ -241,20 +113,287 @@ class TestPDFViewerLoadDocument:
         viewer.close()
         assert viewer._doc is None
 
-    def test_close_stops_worker(self, qapp: QApplication, sample_pdf: Path) -> None:
-        """close() should stop the render worker."""
-        viewer = PDFViewer()
-        viewer.load_document(sample_pdf)
-        viewer.close()
-        assert viewer._worker is None
-
     def test_close_clears_cache(self, qapp: QApplication, sample_pdf: Path) -> None:
-        """close() should clear the pixmap cache."""
+        """close() should set _cache to None."""
         viewer = PDFViewer()
         viewer.load_document(sample_pdf)
-        viewer._cache[0] = "dummy"
         viewer.close()
-        assert len(viewer._cache) == 0
+        assert viewer._cache is None
+
+    def test_close_clears_labels(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """close() should remove all labels."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        assert len(viewer._labels) == 3
+        viewer.close()
+        assert len(viewer._labels) == 0
+
+
+class TestPDFViewerZoom:
+    """Tests for zoom behavior with LRU cache."""
+
+    def test_set_zoom_updates_label_sizes_immediately(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """set_zoom should set label heights to expected values."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+
+        viewer.set_zoom(2.0)
+        for i, label in enumerate(viewer._labels):
+            page = viewer._doc.get_page(i)
+            expected = int(page.height * 2.0)
+            assert label.minimumHeight() == expected
+
+        viewer.close()
+
+    def test_set_zoom_renders_visible_pages_sync(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """set_zoom should render visible pages synchronously."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        old_zoom = viewer.zoom
+        viewer.set_zoom(old_zoom + 0.5)
+
+        assert viewer._cache is not None
+        assert 0 in viewer._cache
+
+        pixmap = viewer._cache.get(0)
+        assert pixmap is not None
+        page = viewer._doc.get_page(0)
+        expected_height = int(page.height * viewer.zoom)
+        assert pixmap.height() == expected_height
+
+        viewer.close()
+
+
+# ── Smooth zoom tests ────────────────────────────────────────
+
+
+class TestZoomAnimator:
+    """Tests for the _ZoomAnimator helper class."""
+
+    def test_animator_not_active_by_default(self, qapp: QApplication) -> None:
+        """Animator should not be active on creation."""
+        viewer = PDFViewer()
+        assert not viewer._animator.active
+
+    def test_animator_starts_active(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """start() should make the animator active."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer._animator.start(1.5, 2.0, QPoint(0, 100))
+        assert viewer._animator.active
+        viewer.close()
+
+    def test_animator_stop_deactivates(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """stop() should deactivate the animator."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer._animator.start(1.5, 2.0, QPoint(0, 100))
+        viewer._animator.stop()
+        assert not viewer._animator.active
+        viewer.close()
+
+    def test_animator_reaches_target(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """After enough time the zoom should reach the target."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        viewer._animator.start(1.5, 2.5, QPoint(0, 100))
+
+        # Wait long enough for all animation frames (~150ms + margin).
+        QTest.qWait(300)
+
+        assert not viewer._animator.active
+        assert viewer.zoom == pytest.approx(2.5, abs=0.01)
+        viewer.close()
+
+    def test_animator_update_target_restarts(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """update_target mid-animation should retarget."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        viewer._animator.start(1.5, 2.0, QPoint(0, 100))
+
+        # Let a couple of frames run, then retarget.
+        QTest.qWait(50)
+        viewer._animator.update_target(3.0, QPoint(0, 200))
+
+        QTest.qWait(300)
+
+        assert viewer.zoom == pytest.approx(3.0, abs=0.01)
+        viewer.close()
+
+    def test_close_stops_animator(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """close() should stop a running animator."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer._animator.start(1.5, 2.0, QPoint(0, 100))
+        assert viewer._animator.active
+        viewer.close()
+        assert not viewer._animator.active
+
+
+class TestApplyZoomUI:
+    """Tests for _apply_zoom_ui — the fast label + scroll update."""
+
+    def test_apply_zoom_ui_updates_zoom(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """_apply_zoom_ui should set _zoom immediately."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer._apply_zoom_ui(2.0, QPoint(0, 0))
+        assert viewer.zoom == 2.0
+        viewer.close()
+
+    def test_apply_zoom_ui_updates_label_heights(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """Label minimum heights should reflect the new zoom."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer._apply_zoom_ui(3.0, QPoint(0, 0))
+        for i, label in enumerate(viewer._labels):
+            page = viewer._doc.get_page(i)
+            assert label.minimumHeight() == int(page.height * 3.0)
+        viewer.close()
+
+    def test_apply_zoom_ui_no_doc_does_not_raise(self, qapp: QApplication) -> None:
+        """_apply_zoom_ui without a document should just set _zoom."""
+        viewer = PDFViewer()
+        viewer._apply_zoom_ui(2.0, QPoint(0, 0))
+        assert viewer.zoom == 2.0
+
+
+class TestComputeAnchor:
+    """Tests for _compute_anchor geometry helper."""
+
+    def test_compute_anchor_top(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """A doc_y of 0 should return page 0, fraction 0."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        page, fraction = viewer._compute_anchor(0)
+        assert page == 0
+        assert fraction == pytest.approx(0.0)
+        viewer.close()
+
+    def test_compute_anchor_mid_page(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """A doc_y at half the first page should return fraction ~0.5."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        h = viewer._labels[0].height()
+        page, fraction = viewer._compute_anchor(h / 2)
+        assert page == 0
+        assert fraction == pytest.approx(0.5, abs=0.01)
+        viewer.close()
+
+    def test_scroll_to_anchor_roundtrip(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """_scroll_to_anchor should reverse _compute_anchor."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+
+        target_doc_y = 300
+        page, frac = viewer._compute_anchor(target_doc_y)
+        scroll = viewer._scroll_to_anchor(page, frac, viewport_y=0)
+        assert scroll == pytest.approx(target_doc_y, abs=1)
+        viewer.close()
+
+
+class TestDefaultAnchor:
+    """Tests for _default_anchor (viewport center)."""
+
+    def test_default_anchor_is_viewport_center(self, qapp: QApplication) -> None:
+        """Default anchor should be at the vertical center of the viewport."""
+        viewer = PDFViewer()
+        viewer.resize(800, 600)
+        qapp.processEvents()
+        anchor = viewer._default_anchor()
+        assert anchor.x() == 0
+        viewport_h = viewer.viewport().height()
+        assert anchor.y() == viewport_h // 2
+
+
+class TestSetZoomAnimate:
+    """Tests for set_zoom with animate=True vs animate=False."""
+
+    def test_set_zoom_immediate(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """set_zoom with animate=False should apply immediately."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.set_zoom(2.5, animate=False)
+        assert viewer.zoom == 2.5
+        assert not viewer._animator.active
+        viewer.close()
+
+    def test_set_zoom_animated(self, qapp: QApplication, sample_pdf: Path) -> None:
+        """set_zoom with animate=True should start the animator."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        viewer.set_zoom(2.5, animate=True)
+        assert viewer._animator.active
+
+        # Wait for animation to complete (~150ms + margin).
+        QTest.qWait(300)
+
+        assert viewer.zoom == pytest.approx(2.5, abs=0.01)
+        assert not viewer._animator.active
+        viewer.close()
+
+    def test_set_zoom_no_animation_preserves_anchor(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """Immediate set_zoom with explicit anchor should keep position."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        # Scroll to a known position.
+        viewer.verticalScrollBar().setValue(100)
+        anchor = QPoint(0, 200)
+
+        viewer.set_zoom(2.0, anchor=anchor, animate=False)
+        qapp.processEvents()
+
+        # Something should have changed (zoom doubled, scroll adjusted).
+        assert viewer.zoom == 2.0
+        viewer.close()
+
+    def test_set_zoom_with_keyboard_anchor_none(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """set_zoom(anchor=None) should use default viewport-center anchor."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        viewer.set_zoom(2.0, anchor=None, animate=False)
+        assert viewer.zoom == 2.0
+        viewer.close()
 
 
 class TestPDFViewerCloseEvent:
@@ -264,19 +403,16 @@ class TestPDFViewerCloseEvent:
         self, qapp: QApplication, sample_pdf: Path
     ) -> None:
         """closeEvent should call close()."""
-        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QCloseEvent
 
         viewer = PDFViewer()
         viewer.load_document(sample_pdf)
         assert viewer._doc is not None
 
-        # Use a real QCloseEvent
-        from PyQt6.QtGui import QCloseEvent
-
         event = QCloseEvent()
         viewer.closeEvent(event)
         assert viewer._doc is None
-        assert viewer._worker is None
+        assert viewer._cache is None
 
     def test_close_event_accepts_event(
         self, qapp: QApplication, sample_pdf: Path
@@ -288,5 +424,4 @@ class TestPDFViewerCloseEvent:
         viewer.load_document(sample_pdf)
         event = QCloseEvent()
         viewer.closeEvent(event)
-        # super().closeEvent() should have been called — no error means success
         viewer.close()

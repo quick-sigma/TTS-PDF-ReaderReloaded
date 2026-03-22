@@ -1,14 +1,27 @@
 # src/pdfreader_reborn/ui/viewer.py
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Queue, Empty
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QPoint, Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QScrollArea, QWidget, QVBoxLayout, QLabel
 
+from pdfreader_reborn.cache import PageAdapter, PageCacheLRU
 from pdfreader_reborn.data.document import PdfDocument
+from pdfreader_reborn.strings import t
+
+DEFAULT_CACHE_CAPACITY = 5
+DEFAULT_CACHE_WORKERS = 2
+
+# ── Smooth zoom constants ─────────────────────────────────────
+_ZOOM_STEP_MS = 16  # ~60 fps
+_ZOOM_DURATION_MS = 150
+_ZOOM_STEPS = max(1, _ZOOM_DURATION_MS // _ZOOM_STEP_MS)
+_ZOOM_MIN_DELTA = 0.001  # stop early when close enough
 
 
 @dataclass
@@ -36,67 +49,77 @@ class PageRenderTask:
         return self.page_number == other.page_number and self.zoom == other.zoom
 
 
-class RenderWorker(QThread):
-    """Background thread that renders PDF pages off the UI thread.
+class PdfDocumentAdapter:
+    """Adapter that wraps a PdfDocument to satisfy the PageAdapter protocol.
 
-    Uses a thread-safe Queue to receive page requests. The worker sleeps
-    efficiently when idle — no busy-waiting or polling loops.
+    Each ``load_page`` call renders the page at the configured zoom
+    and returns raw PNG bytes.  The LRU cache is then responsible for
+    converting these bytes into QPixmaps and managing eviction.
 
-    Attributes:
-        page_ready: Signal emitted with (page_number, pixmap) when done.
+    Args:
+        doc: A loaded ``PdfDocument``.
+        zoom: The zoom factor for rendering.
     """
 
-    page_ready = pyqtSignal(int, QPixmap)
-
-    QUEUE_TIMEOUT: float = 0.1
-    """Seconds to wait for a queue item before checking _running flag."""
-
-    def __init__(self, doc: PdfDocument, zoom: float = 1.5) -> None:
-        """Initialize the render worker.
-
-        Args:
-            doc: The PDF document to render pages from.
-            zoom: Zoom factor for rendering.
-        """
-        super().__init__()
+    def __init__(self, doc: PdfDocument, zoom: float) -> None:
         self._doc = doc
         self._zoom = zoom
-        self._queue: Queue[int] = Queue()
-        self._running = True
-        self._pending: set[int] = set()
 
-    def request_page(self, page_number: int) -> None:
-        """Queue a page for rendering. Thread-safe, deduplicates requests.
+    @property
+    def page_count(self) -> int:
+        """Return the number of pages in the document."""
+        return self._doc.page_count
+
+    @property
+    def zoom(self) -> float:
+        """Return the current zoom factor."""
+        return self._zoom
+
+    @zoom.setter
+    def zoom(self, value: float) -> None:
+        """Update the zoom factor for future loads."""
+        self._zoom = value
+
+    def load_page(self, index: int) -> bytes:
+        """Render a page and return raw PNG bytes.
 
         Args:
-            page_number: Zero-based page index to render.
+            index: Zero-based page index.
+
+        Returns:
+            Raw PNG image bytes.
         """
-        if page_number not in self._pending:
-            self._pending.add(page_number)
-            self._queue.put(page_number)
+        return self._doc.render_page(index, zoom=self._zoom)
 
-    def run(self) -> None:
-        """Main render loop. Blocks on queue, no busy-waiting."""
-        while self._running:
-            try:
-                page_num = self._queue.get(timeout=self.QUEUE_TIMEOUT)
-            except Empty:
-                continue
 
-            try:
-                img_bytes = self._doc.render_page(page_num, zoom=self._zoom)
-                image = QImage.fromData(img_bytes, "PNG")
-                pixmap = QPixmap.fromImage(image)
-                self.page_ready.emit(page_num, pixmap)
-            except Exception:
-                pass
-            finally:
-                self._pending.discard(page_num)
+class PixmapPageAdapter:
+    """Wraps a bytes-based PageAdapter and converts results to QPixmap.
 
-    def stop(self) -> None:
-        """Stop the render loop and wait for the thread to finish."""
-        self._running = False
-        self.wait()
+    This is the adapter that the ``PageCacheLRU`` uses directly.
+
+    Args:
+        inner: A ``PageAdapter`` that returns raw bytes.
+    """
+
+    def __init__(self, inner: PageAdapter[bytes]) -> None:
+        self._inner = inner
+
+    @property
+    def page_count(self) -> int:
+        return self._inner.page_count
+
+    def load_page(self, index: int) -> QPixmap:
+        """Load a page and convert to QPixmap.
+
+        Args:
+            index: Zero-based page index.
+
+        Returns:
+            A QPixmap of the rendered page.
+        """
+        raw = self._inner.load_page(index)
+        image = QImage.fromData(raw, "PNG")
+        return QPixmap.fromImage(image)
 
 
 class Viewer:
@@ -150,13 +173,101 @@ class Viewer:
         raise NotImplementedError
 
 
-class PDFViewer(Viewer, QScrollArea):
-    """Continuous-scroll PDF viewer with lazy page rendering.
+class _ZoomAnimator:
+    """Smoothly interpolate zoom between current and target values.
 
-    Only pages visible in the viewport (plus a small buffer) are rendered.
-    As the user scrolls, new pages are requested from the background worker
-    and already-rendered pages that leave the viewport can be evicted from
-    the pixmap cache to save memory.
+    Uses a QTimer at ~60 fps to step through intermediate zoom values.
+    On each step the viewer's label heights and scroll position are
+    updated for a fluid visual effect.  When the animation settles the
+    expensive page re-rendering is triggered once.
+
+    Rapid wheel events update the *target* so the animation adapts
+    in-flight without restarting from scratch (coalescence).
+
+    Args:
+        viewer: The ``PDFViewer`` that owns this animator.
+    """
+
+    def __init__(self, viewer: PDFViewer) -> None:
+        self._viewer = viewer
+        self._timer = QTimer()
+        self._timer.setInterval(_ZOOM_STEP_MS)
+        self._timer.timeout.connect(self._step)
+
+        self._start_zoom: float = 0.0
+        self._target_zoom: float = 0.0
+        self._anchor: QPoint | None = None
+        self._frame: int = 0
+
+    # ── public API ──────────────────────────────────────────
+
+    def start(self, current: float, target: float, anchor: QPoint | None) -> None:
+        """Begin (or re-target) an animation.
+
+        Args:
+            current: Zoom level when the animation starts.
+            target: Desired final zoom level.
+            anchor: Viewport position to zoom toward.
+        """
+        self._start_zoom = current
+        self._target_zoom = target
+        self._anchor = anchor
+        self._frame = 0
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def update_target(self, target: float, anchor: QPoint | None) -> None:
+        """Retarget the running animation from the *current* zoom.
+
+        If no animation is running this is equivalent to ``start``.
+        """
+        current = self._viewer.zoom
+        if self._timer.isActive():
+            self._start_zoom = current
+            self._target_zoom = target
+            self._anchor = anchor
+            self._frame = 0
+        else:
+            self.start(current, target, anchor)
+
+    def stop(self) -> None:
+        """Immediately stop the animation."""
+        self._timer.stop()
+
+    @property
+    def active(self) -> bool:
+        """Return True while the animation timer is running."""
+        return self._timer.isActive()
+
+    # ── internals ───────────────────────────────────────────
+
+    def _step(self) -> None:
+        """Advance one animation frame."""
+        self._frame += 1
+        progress = min(1.0, self._frame / _ZOOM_STEPS)
+
+        # ease-out cubic: fast start, gentle landing
+        eased = 1.0 - (1.0 - progress) ** 3
+        zoom = self._start_zoom + (self._target_zoom - self._start_zoom) * eased
+
+        if progress >= 1.0 or abs(zoom - self._target_zoom) < _ZOOM_MIN_DELTA:
+            self._timer.stop()
+            self._viewer._apply_zoom_ui(self._target_zoom, self._anchor)
+            self._viewer._finish_zoom()
+            return
+
+        self._viewer._apply_zoom_ui(zoom, self._anchor)
+
+
+class PDFViewer(Viewer, QScrollArea):
+    """Continuous-scroll PDF viewer with LRU page caching.
+
+    Uses a ``PageCacheLRU`` backed by a thread pool to load and evict
+    pages around the current scroll position.  As the user scrolls,
+    the focus updates and the cache preloads neighboring pages
+    asynchronously.
+
+    Zoom transitions are animated smoothly via :class:`_ZoomAnimator`.
 
     Usage::
 
@@ -165,8 +276,11 @@ class PDFViewer(Viewer, QScrollArea):
         viewer.set_zoom(2.0)
     """
 
-    CACHE_AHEAD: int = 3
-    CACHE_BEHIND: int = 1
+    zoom_in = pyqtSignal(QPoint)
+    """Emitted on Ctrl+scroll-up with the mouse position as anchor."""
+
+    zoom_out = pyqtSignal(QPoint)
+    """Emitted on Ctrl+scroll-down with the mouse position as anchor."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """Initialize the PDF viewer.
@@ -188,69 +302,125 @@ class PDFViewer(Viewer, QScrollArea):
         self._doc: PdfDocument | None = None
         self._zoom: float = 1.5
         self._labels: list[QLabel] = []
-        self._cache: dict[int, QPixmap] = {}
-        self._worker: RenderWorker | None = None
+
+        self._adapter: PdfDocumentAdapter | None = None
+        self._cache: PageCacheLRU[QPixmap] | None = None
+        self._animator = _ZoomAnimator(self)
+
+    # ── Document lifecycle ────────────────────────────────────
 
     def load_document(self, path: Path | str) -> None:
-        """Open a PDF and prepare page placeholders.
+        """Open a PDF and prepare page placeholders with LRU cache.
 
         Args:
             path: Path to the PDF file.
         """
-        self._cleanup_worker()
+        self.close()
 
         self._doc = PdfDocument(path)
-        self._cache.clear()
-
-        for label in self._labels:
-            self._layout.removeWidget(label)
-            label.deleteLater()
-        self._labels.clear()
+        self._adapter = PdfDocumentAdapter(self._doc, self._zoom)
+        pixmap_adapter = PixmapPageAdapter(self._adapter)
+        self._cache = PageCacheLRU(
+            adapter=pixmap_adapter,
+            capacity=DEFAULT_CACHE_CAPACITY,
+            max_workers=DEFAULT_CACHE_WORKERS,
+        )
+        self._cache.on_loaded(self._on_cache_page_loaded)
 
         for i in range(self._doc.page_count):
-            label = QLabel(f"Page {i + 1} — loading…")
+            label = QLabel(t("viewer.page_loading", page=i + 1))
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setMinimumHeight(200)
             label.setStyleSheet("background: #f0f0f0; border: 1px solid #ccc;")
             self._layout.addWidget(label)
             self._labels.append(label)
 
-        self._start_worker()
+        # Seed the cache around page 0.
+        self._cache.focus = 0
 
-    def _start_worker(self) -> None:
-        """Start the background render worker."""
-        if self._doc is None:
-            return
-        self._worker = RenderWorker(self._doc, self._zoom)
-        self._worker.page_ready.connect(self._on_page_ready)
-        self._worker.start()
-        self._request_visible_pages()
+    def retranslate(self) -> None:
+        """Update all translatable text on existing labels."""
+        for i, label in enumerate(self._labels):
+            if not label.pixmap():
+                label.setText(t("viewer.page_loading", page=i + 1))
 
-    def _on_page_ready(self, page_number: int, pixmap: QPixmap) -> None:
-        """Handle a rendered page from the worker.
+    def _on_cache_page_loaded(self, page_number: int) -> None:
+        """Handle a page arriving in the LRU cache.
 
-        Args:
-            page_number: Zero-based page index.
-            pixmap: The rendered page image.
+        Connected to ``PageCacheLRU.on_loaded``.
         """
+        if self._cache is None:
+            return
+        pixmap = self._cache.get(page_number)
+        if pixmap is None:
+            return
         self._apply_pixmap(page_number, pixmap)
 
+    # ── Scrolling / lazy loading ─────────────────────────────
+
     def scrollContentsBy(self, dx: int, dy: int) -> None:
-        """Handle scroll events to trigger lazy loading.
+        """Handle scroll events to update cache focus.
 
         Args:
             dx: Horizontal scroll delta.
             dy: Vertical scroll delta.
         """
         super().scrollContentsBy(dx, dy)
-        self._request_visible_pages()
+        self._update_focus_from_scroll()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Intercept Ctrl+wheel to zoom toward the mouse cursor.
+
+        Non-Ctrl wheel events pass through to the default scroll handler.
+
+        Args:
+            event: The wheel event.
+        """
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            anchor = event.position().toPoint()
+            delta = event.angleDelta().y()
+            if delta > 0:
+                new_target = self.zoom + 0.25
+            elif delta < 0:
+                new_target = max(0.5, self.zoom - 0.25)
+            else:
+                return
+            self.set_zoom(new_target, anchor=anchor, animate=True)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def _update_focus_from_scroll(self) -> None:
+        """Detect which page is most visible and update cache focus."""
+        if self._cache is None or not self._labels:
+            return
+
+        viewport_height = self.viewport().height()
+        scroll_pos = self.verticalScrollBar().value()
+        viewport_center = scroll_pos + viewport_height // 2
+
+        y_offset = 0
+        best_index = 0
+        best_distance = float("inf")
+
+        for i, label in enumerate(self._labels):
+            label_top = y_offset
+            label_bottom = y_offset + label.height()
+            y_offset += label.height() + self._layout.spacing()
+
+            label_center = (label_top + label_bottom) // 2
+            distance = abs(label_center - viewport_center)
+            if distance < best_distance:
+                best_distance = distance
+                best_index = i
+
+        if self._cache.focus != best_index:
+            self._cache.focus = best_index
+
+    # ── Render helpers ───────────────────────────────────────
 
     def _get_visible_range(self) -> tuple[int, int]:
-        """Return (start, end) indices of pages near the viewport.
-
-        Returns:
-            A tuple of (start, end) where start is inclusive and end is exclusive.
-        """
+        """Return (start, end) indices of pages near the viewport."""
         viewport_height = self.viewport().height()
         scroll_pos = self.verticalScrollBar().value()
 
@@ -271,8 +441,8 @@ class PDFViewer(Viewer, QScrollArea):
         if not visible:
             return (0, 0)
 
-        start = max(0, min(visible) - self.CACHE_BEHIND)
-        end = min(len(self._labels), max(visible) + self.CACHE_AHEAD + 1)
+        start = max(0, min(visible) - 1)
+        end = min(len(self._labels), max(visible) + 3 + 1)
         return (start, end)
 
     def _render_page_sync(self, page_number: int) -> QPixmap | None:
@@ -284,12 +454,10 @@ class PDFViewer(Viewer, QScrollArea):
         Returns:
             A QPixmap if successful, or None on error.
         """
-        if self._doc is None:
+        if self._cache is None:
             return None
         try:
-            img_bytes = self._doc.render_page(page_number, zoom=self._zoom)
-            image = QImage.fromData(img_bytes, "PNG")
-            return QPixmap.fromImage(image)
+            return self._cache.get_or_load(page_number)
         except Exception:
             return None
 
@@ -302,65 +470,145 @@ class PDFViewer(Viewer, QScrollArea):
         """
         if page_number < 0 or page_number >= len(self._labels):
             return
-        self._cache[page_number] = pixmap
         label = self._labels[page_number]
         label.setPixmap(pixmap)
         label.setMinimumHeight(pixmap.height())
         label.setText("")
 
-    def _request_visible_pages(self) -> None:
-        """Request rendering for visible pages and evict off-screen ones."""
-        if self._doc is None or self._worker is None:
-            return
+    # ── Zoom ─────────────────────────────────────────────────
 
-        start, end = self._get_visible_range()
+    def _default_anchor(self) -> QPoint:
+        """Return the viewport center as default zoom anchor."""
+        return QPoint(0, self.viewport().height() // 2)
 
-        for i in range(start, end):
-            if i not in self._cache:
-                self._worker.request_page(i)
+    def set_zoom(
+        self, zoom: float, anchor: QPoint | None = None, animate: bool = False
+    ) -> None:
+        """Set the zoom factor.
 
-        evict = [k for k in self._cache if k < start or k >= end]
-        for k in evict:
-            del self._cache[k]
+        When *anchor* is ``None`` the viewport centre is used so that
+        keyboard / toolbar zooms feel natural.
 
-    def set_zoom(self, zoom: float) -> None:
-        """Set the zoom factor and re-render all pages atomically.
-
-        Pages in the viewport are rendered synchronously so that both
-        label sizes and pixmaps change on the same frame, eliminating
-        the visual "separate then rejoin" bounce.
+        When *animate* is ``True`` the label heights and scroll
+        position transition smoothly via :class:`_ZoomAnimator` and
+        the expensive page re-rendering is deferred until the
+        animation settles.  When *animate* is ``False`` the zoom
+        is applied immediately (labels, scroll, and re-render in
+        one shot).
 
         Args:
             zoom: New zoom factor (1.0 = 100%).
+            anchor: Optional viewport position to zoom toward.
+            animate: Whether to use a smooth transition.
+        """
+        if anchor is None:
+            anchor = self._default_anchor()
+
+        if self._doc is None or not self._labels:
+            self._zoom = zoom
+            return
+
+        if abs(zoom - self._zoom) < _ZOOM_MIN_DELTA:
+            return
+
+        if animate:
+            self._animator.update_target(zoom, anchor)
+        else:
+            self._animator.stop()
+            self._apply_zoom_ui(zoom, anchor)
+            self._finish_zoom()
+
+    def _apply_zoom_ui(self, zoom: float, anchor: QPoint | None) -> None:
+        """Fast label-height + scroll update (no rendering).
+
+        Called on every animation frame.  Keeps the document point
+        under *anchor* visually stationary.
         """
         if self._doc is None or not self._labels:
             self._zoom = zoom
             return
 
-        # Phase 1: determine which pages are currently visible.
-        vis_start, vis_end = self._get_visible_range()
+        # --- snapshot the anchor point in document space ----------
+        scroll_pos = self.verticalScrollBar().value()
+        anchor_y = anchor.y() if anchor is not None else 0
+        doc_y = scroll_pos + anchor_y
 
-        # Phase 2: update zoom and pre-compute new label heights.
+        anchor_page, anchor_fraction = self._compute_anchor(doc_y)
+
+        # --- apply new zoom to labels -----------------------------
         self._zoom = zoom
+        if self._adapter is not None:
+            self._adapter.zoom = zoom
         self._update_label_sizes()
 
-        # Phase 3: clear old state and render visible pages synchronously.
+        # --- restore scroll so the anchor stays put ---------------
+        new_scroll = self._scroll_to_anchor(anchor_page, anchor_fraction, anchor_y)
+        self.verticalScrollBar().setValue(max(0, new_scroll))
+
+    def _finish_zoom(self) -> None:
+        """Re-render visible pages at the final zoom level.
+
+        Called once when the zoom animation settles.
+        """
+        if self._cache is None or self._doc is None:
+            return
+
+        vis_start, vis_end = self._get_visible_range()
         self._cache.clear()
+
         for i in range(vis_start, min(vis_end, len(self._labels))):
             pixmap = self._render_page_sync(i)
             if pixmap is not None:
                 self._apply_pixmap(i, pixmap)
 
-        # Phase 4: start background worker for remaining pages.
-        self._cleanup_worker()
-        self._start_worker()
+        # Update cache focus so neighbours begin preloading.
+        self._update_focus_from_scroll()
+
+    # ── Zoom geometry helpers ────────────────────────────────
+
+    def _compute_anchor(self, doc_y: float) -> tuple[int, float]:
+        """Find the page index and fractional offset for a document y.
+
+        Args:
+            doc_y: Absolute y coordinate in the document (px).
+
+        Returns:
+            ``(page_index, fraction)`` where *fraction* is in [0, 1).
+        """
+        y_offset = 0.0
+        for i, label in enumerate(self._labels):
+            lh = label.height()
+            if y_offset + lh >= doc_y:
+                fraction = (doc_y - y_offset) / lh if lh > 0 else 0.0
+                return (i, fraction)
+            y_offset += lh + self._layout.spacing()
+        return (max(0, len(self._labels) - 1), 0.0)
+
+    def _scroll_to_anchor(
+        self,
+        page: int,
+        fraction: float,
+        viewport_y: int,
+    ) -> int:
+        """Compute the scroll value that places *page*/*fraction* at *viewport_y*.
+
+        Args:
+            page: Target page index.
+            fraction: Fractional position within the page [0, 1).
+            viewport_y: Desired viewport y for that document point.
+
+        Returns:
+            The vertical scroll-bar value.
+        """
+        y = 0
+        for i in range(page):
+            y += self._labels[i].height() + self._layout.spacing()
+        if page < len(self._labels):
+            y += int(self._labels[page].height() * fraction)
+        return y - viewport_y
 
     def _update_label_sizes(self) -> None:
-        """Pre-compute and set expected label heights at current zoom.
-
-        Prevents layout bounce during zoom by giving every label its
-        final height before the background renderer produces pixmaps.
-        """
+        """Pre-compute and set expected label heights at current zoom."""
         if self._doc is None:
             return
         for i, label in enumerate(self._labels):
@@ -373,16 +621,22 @@ class PDFViewer(Viewer, QScrollArea):
         """Return the current zoom factor."""
         return self._zoom
 
-    def _cleanup_worker(self) -> None:
-        """Stop and clean up the render worker."""
-        if self._worker is not None:
-            self._worker.stop()
-            self._worker = None
+    # ── Cleanup ──────────────────────────────────────────────
 
     def close(self) -> None:
         """Close the document and release resources."""
-        self._cleanup_worker()
-        self._cache.clear()
+        self._animator.stop()
+
+        if self._cache is not None:
+            self._cache.shutdown()
+            self._cache = None
+        self._adapter = None
+
+        for label in self._labels:
+            self._layout.removeWidget(label)
+            label.deleteLater()
+        self._labels.clear()
+
         if self._doc is not None:
             self._doc.close()
             self._doc = None
