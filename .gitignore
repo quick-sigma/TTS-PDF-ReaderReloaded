@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# --- Python/uv ---
+# Virtual environment
+.venv/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+# UV lockfile (common practice is to commit this, but ignore if needed)
+# uv.lock
+# Distribution / build
+dist/
+build/
+*.egg-info/
+
+# --- Testing ---
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+junit.xml
+
+# --- Qt / PySide / PyQt ---
+# Qt temporary files
+.qmake.stash
+*.pro.user
+# If using PySide/PyQt, ignore generated UI files if they are generated on the fly
+# ui_*.py
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
