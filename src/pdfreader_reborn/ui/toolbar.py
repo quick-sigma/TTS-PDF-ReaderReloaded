@@ -175,6 +175,9 @@ class NavigationToolbar(Toolbar):
         """
         toolbar = QToolBar("Navigation")
         toolbar.setMovable(True)
+        self._actions: list = []
         for element in self:
-            toolbar.addAction(element.to_qaction())
+            action = element.to_qaction()
+            self._actions.append(action)
+            toolbar.addAction(action)
         return toolbar

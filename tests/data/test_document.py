@@ -1,11 +1,31 @@
 import pytest
 from pathlib import Path
 
-from pdfreader_reborn.data.pdf_loader import PdfDocument, PdfLoadError
+from pdfreader_reborn.data.document import (
+    Document,
+    PdfDocument,
+    PdfLoadError,
+    Page,
+)
+
+
+class TestDocument:
+    """Tests for the Document abstract base class."""
+
+    def test_document_is_abstract(self) -> None:
+        """Document cannot be instantiated directly."""
+        with pytest.raises(TypeError):
+            Document()  # type: ignore[abstract]
 
 
 class TestPdfDocument:
     """Tests for PDF document loading and page access."""
+
+    def test_pdf_document_implements_document(self, sample_pdf: Path) -> None:
+        """PdfDocument should be a subclass of Document."""
+        doc = PdfDocument(sample_pdf)
+        assert isinstance(doc, Document)
+        doc.close()
 
     def test_load_nonexistent_file_raises_error(self, tmp_path: Path) -> None:
         """Loading a nonexistent file should raise PdfLoadError."""
@@ -70,3 +90,35 @@ class TestPdfDocument:
         with PdfDocument(sample_pdf) as doc:
             meta = doc.metadata
             assert isinstance(meta, dict)
+
+
+class TestPage:
+    """Tests for the Page class."""
+
+    def test_page_has_page_number(self, sample_pdf: Path) -> None:
+        """Page should store the page number."""
+        with PdfDocument(sample_pdf) as doc:
+            page = doc.get_page(0)
+            assert page.page_number == 0
+
+    def test_page_has_dimensions(self, sample_pdf: Path) -> None:
+        """Page should have width and height."""
+        with PdfDocument(sample_pdf) as doc:
+            page = doc.get_page(0)
+            assert page.width > 0
+            assert page.height > 0
+
+    def test_page_render(self, sample_pdf: Path) -> None:
+        """Page.render() should return PNG bytes."""
+        with PdfDocument(sample_pdf) as doc:
+            page = doc.get_page(0)
+            img_bytes = page.render(zoom=1.0)
+            assert isinstance(img_bytes, bytes)
+            assert img_bytes[:4] == b"\x89PNG"
+
+    def test_page_extract_text(self, sample_pdf: Path) -> None:
+        """Page.extract_text() should return text string."""
+        with PdfDocument(sample_pdf) as doc:
+            page = doc.get_page(0)
+            text = page.extract_text()
+            assert isinstance(text, str)

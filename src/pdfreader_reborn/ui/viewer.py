@@ -5,12 +5,18 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QScrollArea, QWidget, QVBoxLayout, QLabel
 
-from pdfreader_reborn.data.pdf_loader import PdfDocument
+from pdfreader_reborn.data.document import PdfDocument
 
 
 @dataclass
 class PageRenderTask:
-    """Metadata for a page that needs to be (or has been) rendered."""
+    """Metadata for a page that needs to be (or has been) rendered.
+
+    Attributes:
+        page_number: Zero-based page index.
+        zoom: Zoom factor for rendering.
+        pixmap: Rendered pixmap, or None if not yet rendered.
+    """
 
     page_number: int
     zoom: float
@@ -18,6 +24,7 @@ class PageRenderTask:
 
     @property
     def is_rendered(self) -> bool:
+        """Return True if the page has been rendered."""
         return self.pixmap is not None
 
     def __eq__(self, other: object) -> bool:
@@ -27,11 +34,24 @@ class PageRenderTask:
 
 
 class RenderWorker(QThread):
-    """Background thread that renders PDF pages off the UI thread."""
+    """Background thread that renders PDF pages off the UI thread.
+
+    Pages are queued via ``request_page()`` and rendered asynchronously.
+    When a page is ready, the ``page_ready`` signal is emitted.
+
+    Attributes:
+        page_ready: Signal emitted with (page_number, pixmap) when done.
+    """
 
     page_ready = pyqtSignal(int, QPixmap)
 
     def __init__(self, doc: PdfDocument, zoom: float = 1.5) -> None:
+        """Initialize the render worker.
+
+        Args:
+            doc: The PDF document to render pages from.
+            zoom: Zoom factor for rendering.
+        """
         super().__init__()
         self._doc = doc
         self._zoom = zoom
@@ -39,10 +59,16 @@ class RenderWorker(QThread):
         self._running = True
 
     def request_page(self, page_number: int) -> None:
+        """Queue a page for rendering.
+
+        Args:
+            page_number: Zero-based page index to render.
+        """
         if page_number not in self._queue:
             self._queue.append(page_number)
 
     def run(self) -> None:
+        """Main render loop. Processes queued pages until stopped."""
         while self._running:
             if not self._queue:
                 self.msleep(16)
@@ -58,23 +84,86 @@ class RenderWorker(QThread):
                 pass
 
     def stop(self) -> None:
+        """Stop the render loop and wait for the thread to finish."""
         self._running = False
         self.wait()
 
 
-class PdfViewport(QScrollArea):
+class Viewer:
+    """Abstract base class for document viewers.
+
+    A viewer is responsible for displaying document content with features
+    like zoom and lazy loading. Subclasses must implement the abstract
+    methods to provide format-specific rendering.
+
+    Note: This class uses duck typing rather than ABC to allow multiple
+    inheritance with Qt widgets.
+    """
+
+    def load_document(self, path: Path | str) -> None:
+        """Open and display a document.
+
+        Args:
+            path: Path to the document file.
+
+        Raises:
+            NotImplementedError: If not implemented by subclass.
+        """
+        raise NotImplementedError
+
+    def set_zoom(self, zoom: float) -> None:
+        """Set the zoom factor.
+
+        Args:
+            zoom: New zoom factor (1.0 = 100%).
+
+        Raises:
+            NotImplementedError: If not implemented by subclass.
+        """
+        raise NotImplementedError
+
+    @property
+    def zoom(self) -> float:
+        """Return the current zoom factor.
+
+        Raises:
+            NotImplementedError: If not implemented by subclass.
+        """
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Close the current document and release resources.
+
+        Raises:
+            NotImplementedError: If not implemented by subclass.
+        """
+        raise NotImplementedError
+
+
+class PDFViewer(Viewer, QScrollArea):
     """Continuous-scroll PDF viewer with lazy page rendering.
 
     Only pages visible in the viewport (plus a small buffer) are rendered.
     As the user scrolls, new pages are requested from the background worker
     and already-rendered pages that leave the viewport can be evicted from
     the pixmap cache to save memory.
+
+    Usage::
+
+        viewer = PDFViewer()
+        viewer.load_document(Path("report.pdf"))
+        viewer.set_zoom(2.0)
     """
 
-    CACHE_AHEAD = 3
-    CACHE_BEHIND = 1
+    CACHE_AHEAD: int = 3
+    CACHE_BEHIND: int = 1
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        """Initialize the PDF viewer.
+
+        Args:
+            parent: Optional parent widget.
+        """
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -93,7 +182,11 @@ class PdfViewport(QScrollArea):
         self._worker: RenderWorker | None = None
 
     def load_document(self, path: Path | str) -> None:
-        """Open a PDF and prepare page placeholders."""
+        """Open a PDF and prepare page placeholders.
+
+        Args:
+            path: Path to the PDF file.
+        """
         self._cleanup_worker()
 
         self._doc = PdfDocument(path)
@@ -115,6 +208,7 @@ class PdfViewport(QScrollArea):
         self._start_worker()
 
     def _start_worker(self) -> None:
+        """Start the background render worker."""
         if self._doc is None:
             return
         self._worker = RenderWorker(self._doc, self._zoom)
@@ -123,6 +217,12 @@ class PdfViewport(QScrollArea):
         self._request_visible_pages()
 
     def _on_page_ready(self, page_number: int, pixmap: QPixmap) -> None:
+        """Handle a rendered page from the worker.
+
+        Args:
+            page_number: Zero-based page index.
+            pixmap: The rendered page image.
+        """
         if page_number < 0 or page_number >= len(self._labels):
             return
         self._cache[page_number] = pixmap
@@ -132,10 +232,17 @@ class PdfViewport(QScrollArea):
         label.setText("")
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
+        """Handle scroll events to trigger lazy loading.
+
+        Args:
+            dx: Horizontal scroll delta.
+            dy: Vertical scroll delta.
+        """
         super().scrollContentsBy(dx, dy)
         self._request_visible_pages()
 
     def _request_visible_pages(self) -> None:
+        """Request rendering for visible pages and evict off-screen ones."""
         if self._doc is None or self._worker is None:
             return
 
@@ -170,20 +277,40 @@ class PdfViewport(QScrollArea):
             del self._cache[k]
 
     def set_zoom(self, zoom: float) -> None:
+        """Set the zoom factor and re-render all pages.
+
+        Args:
+            zoom: New zoom factor (1.0 = 100%).
+        """
         self._zoom = zoom
         self._cache.clear()
         if self._doc is not None:
             self._cleanup_worker()
             self._start_worker()
 
+    @property
+    def zoom(self) -> float:
+        """Return the current zoom factor."""
+        return self._zoom
+
     def _cleanup_worker(self) -> None:
+        """Stop and clean up the render worker."""
         if self._worker is not None:
             self._worker.stop()
             self._worker = None
 
-    def closeEvent(self, event) -> None:  # noqa: ANN001
+    def close(self) -> None:
+        """Close the document and release resources."""
         self._cleanup_worker()
         if self._doc is not None:
             self._doc.close()
             self._doc = None
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        """Handle widget close event.
+
+        Args:
+            event: The close event.
+        """
+        self.close()
         super().closeEvent(event)
