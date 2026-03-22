@@ -1,3 +1,5 @@
+# tests/data/test_document.py
+
 import pytest
 from pathlib import Path
 
@@ -6,6 +8,8 @@ from pdfreader_reborn.data.document import (
     PdfDocument,
     PdfLoadError,
     Page,
+    FitzRenderer,
+    PageRenderer,
 )
 
 
@@ -16,6 +20,44 @@ class TestDocument:
         """Document cannot be instantiated directly."""
         with pytest.raises(TypeError):
             Document()  # type: ignore[abstract]
+
+
+class TestFitzRenderer:
+    """Tests for the FitzRenderer backend."""
+
+    def test_renderer_renders_png(self, sample_pdf: Path) -> None:
+        """FitzRenderer should produce PNG bytes."""
+        import fitz
+
+        doc = fitz.open(str(sample_pdf))
+        renderer = FitzRenderer(doc)
+        img = renderer.render(0, zoom=1.0)
+        assert img[:4] == b"\x89PNG"
+        doc.close()
+
+    def test_renderer_extracts_text(self, sample_pdf: Path) -> None:
+        """FitzRenderer should extract text."""
+        import fitz
+
+        doc = fitz.open(str(sample_pdf))
+        renderer = FitzRenderer(doc)
+        text = renderer.extract_text(0)
+        assert isinstance(text, str)
+        assert len(text) > 0
+        doc.close()
+
+
+class TestPageRenderer:
+    """Tests for the PageRenderer protocol."""
+
+    def test_fitz_renderer_satisfies_protocol(self, sample_pdf: Path) -> None:
+        """FitzRenderer should satisfy the PageRenderer protocol."""
+        import fitz
+
+        doc = fitz.open(str(sample_pdf))
+        renderer = FitzRenderer(doc)
+        assert isinstance(renderer, PageRenderer)
+        doc.close()
 
 
 class TestPdfDocument:
@@ -61,13 +103,33 @@ class TestPdfDocument:
             doc.get_page(999)
         doc.close()
 
+    def test_get_page_on_closed_document_raises(self, sample_pdf: Path) -> None:
+        """get_page on a closed document should raise RuntimeError."""
+        doc = PdfDocument(sample_pdf)
+        doc.close()
+        with pytest.raises(RuntimeError, match="Document is closed"):
+            doc.get_page(0)
+
+    def test_render_page_on_closed_document_raises(self, sample_pdf: Path) -> None:
+        """render_page on a closed document should raise RuntimeError."""
+        doc = PdfDocument(sample_pdf)
+        doc.close()
+        with pytest.raises(RuntimeError, match="Document is closed"):
+            doc.render_page(0)
+
+    def test_extract_text_on_closed_document_raises(self, sample_pdf: Path) -> None:
+        """extract_text on a closed document should raise RuntimeError."""
+        doc = PdfDocument(sample_pdf)
+        doc.close()
+        with pytest.raises(RuntimeError, match="Document is closed"):
+            doc.extract_text(0)
+
     def test_render_page_returns_bytes(self, sample_pdf: Path) -> None:
         """Rendering a page should return raw image bytes (PNG)."""
         doc = PdfDocument(sample_pdf)
         img_bytes = doc.render_page(0, zoom=1.0)
         assert isinstance(img_bytes, bytes)
         assert len(img_bytes) > 0
-        # PNG signature
         assert img_bytes[:4] == b"\x89PNG"
         doc.close()
 
@@ -75,7 +137,6 @@ class TestPdfDocument:
         """Using 'with' statement should close the document automatically."""
         with PdfDocument(sample_pdf) as doc:
             assert doc.page_count == 3
-        # After exiting context, internal fitz.Document should be closed
         assert doc._doc is None
 
     def test_extract_text_from_page(self, sample_pdf: Path) -> None:
@@ -90,6 +151,13 @@ class TestPdfDocument:
         with PdfDocument(sample_pdf) as doc:
             meta = doc.metadata
             assert isinstance(meta, dict)
+
+    def test_page_does_not_hold_fitz_reference(self, sample_pdf: Path) -> None:
+        """Page should hold a renderer, not a raw fitz.Document."""
+        with PdfDocument(sample_pdf) as doc:
+            page = doc.get_page(0)
+            assert not hasattr(page, "_doc")
+            assert hasattr(page, "_renderer")
 
 
 class TestPage:

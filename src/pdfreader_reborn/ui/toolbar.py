@@ -1,3 +1,5 @@
+# src/pdfreader_reborn/ui/toolbar.py
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -46,6 +48,18 @@ class Toolbar(ABC):
         else:
             assert self._tail is not None
             self._tail.next = element
+            self._tail = element
+        self._size += 1
+
+    def add_first(self, element: ToolbarElement) -> None:
+        """Prepend an element to the beginning of the linked list.
+
+        Args:
+            element: The ToolbarElement to prepend.
+        """
+        element.next = self._head
+        self._head = element
+        if self._tail is None:
             self._tail = element
         self._size += 1
 
@@ -103,25 +117,30 @@ class Toolbar(ABC):
 
 
 class NavigationToolbar(Toolbar):
-    """Navigation toolbar with Open, Zoom In, and Zoom Out buttons.
+    """Navigation toolbar with Zoom In and Zoom Out buttons.
 
-    This is the primary toolbar for document navigation. It provides
-    file opening and zoom controls using the project's SVG icons.
+    Open File is provided by the plugin system (see ``OpenFilePlugin``).
+    Buttons emit signals via callbacks. Keyboard shortcuts are NOT set
+    on QActions — they are managed exclusively by KeyboardManager to
+    prevent double-dispatch.
 
     Usage::
 
         toolbar = NavigationToolbar(
             icons_dir,
-            on_open=lambda: print("Open"),
-            on_zoom_in=lambda: print("Zoom +"),
-            on_zoom_out=lambda: print("Zoom -"),
+            on_zoom_in=lambda: signals.zoom_in.emit(),
+            on_zoom_out=lambda: signals.zoom_out.emit(),
         )
+        kernel = Kernel()
+        open_buttons = kernel.get_toolbar_buttons(icons_dir)
+        for btn in reversed(open_buttons):
+            toolbar.add_first(btn)
+        main_window.addToolBar(toolbar.to_qtoolbar())
     """
 
     def __init__(
         self,
         icons_dir: Path,
-        on_open: Callable[[], None] | None = None,
         on_zoom_in: Callable[[], None] | None = None,
         on_zoom_out: Callable[[], None] | None = None,
     ) -> None:
@@ -129,41 +148,29 @@ class NavigationToolbar(Toolbar):
 
         Args:
             icons_dir: Path to the directory containing SVG icons.
-            on_open: Callback for the Open button.
             on_zoom_in: Callback for the Zoom In button.
             on_zoom_out: Callback for the Zoom Out button.
         """
         super().__init__()
         self._icons_dir = icons_dir
-        self._on_open = on_open
         self._on_zoom_in = on_zoom_in
         self._on_zoom_out = on_zoom_out
         self._build()
 
     def _build(self) -> None:
-        """Construct the toolbar elements from SVG icons."""
-        open_btn = Button(
-            icon=SVGIcon(self._icons_dir / "openFile.svg"),
-            label="Open PDF",
-            tooltip="Open PDF file",
-            shortcut="Ctrl+O",
-            on_click=self._on_open,
-        )
+        """Construct toolbar elements. No shortcuts — KeyboardManager owns those."""
         zoom_in_btn = Button(
             icon=SVGIcon(self._icons_dir / "zoomIn.svg"),
             label="Zoom In",
             tooltip="Zoom in (Ctrl+=)",
-            shortcut="Ctrl+=",
             on_click=self._on_zoom_in,
         )
         zoom_out_btn = Button(
             icon=SVGIcon(self._icons_dir / "zoomOut.svg"),
             label="Zoom Out",
             tooltip="Zoom out (Ctrl+-)",
-            shortcut="Ctrl+-",
             on_click=self._on_zoom_out,
         )
-        self.add(open_btn)
         self.add(zoom_in_btn)
         self.add(zoom_out_btn)
 

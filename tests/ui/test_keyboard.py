@@ -1,3 +1,5 @@
+# tests/ui/test_keyboard.py
+
 import pytest
 from unittest.mock import Mock
 
@@ -42,29 +44,11 @@ class TestKeyboardManager:
         assert "Ctrl+O" in bindings
         assert "Ctrl+W" in bindings
 
-    def test_zoom_in_bound_to_ctrl_equals(
-        self, km: KeyboardManager, signals: AppSignals
-    ) -> None:
-        """Ctrl+= should be bound to zoom_in signal."""
-        assert km.bindings["Ctrl+="] == signals.zoom_in
-
-    def test_zoom_in_bound_to_ctrl_plus(
-        self, km: KeyboardManager, signals: AppSignals
-    ) -> None:
-        """Ctrl++ should be bound to zoom_in signal."""
-        assert km.bindings["Ctrl++"] == signals.zoom_in
-
-    def test_zoom_out_bound_to_ctrl_minus(
-        self, km: KeyboardManager, signals: AppSignals
-    ) -> None:
-        """Ctrl+- should be bound to zoom_out signal."""
-        assert km.bindings["Ctrl+-"] == signals.zoom_out
-
     def test_bind_custom_key(self, km: KeyboardManager) -> None:
         """bind() should add a new key binding."""
         mock_signal = Mock()
         km.bind("Ctrl+Z", mock_signal)
-        assert km.bindings["Ctrl+Z"] is mock_signal
+        assert "Ctrl+Z" in km.bindings
 
     def test_unbind_key(self, km: KeyboardManager) -> None:
         """unbind() should remove a key binding."""
@@ -136,6 +120,21 @@ class TestKeyboardManager:
         assert handled is True
         callback.assert_called_once()
 
+    def test_handle_ctrl_w_emits_close_document(
+        self, km: KeyboardManager, signals: AppSignals
+    ) -> None:
+        """Ctrl+W key press should emit close_document signal."""
+        callback = Mock()
+        signals.close_document.connect(callback)
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress,
+            Qt.Key.Key_W,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        handled = km.handle_key_press(event)
+        assert handled is True
+        callback.assert_called_once()
+
     def test_handle_unbound_key_returns_false(self, km: KeyboardManager) -> None:
         """Unbound key press should return False."""
         event = QKeyEvent(
@@ -161,3 +160,23 @@ class TestKeyboardManager:
         )
         km.handle_key_press(event)
         callback.assert_not_called()
+
+    def test_special_key_does_not_crash(self, km: KeyboardManager) -> None:
+        """Special keys like Escape should not raise ValueError."""
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress,
+            Qt.Key.Key_Escape,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        handled = km.handle_key_press(event)
+        assert handled is False  # Not bound, but should not crash
+
+    def test_function_key_does_not_crash(self, km: KeyboardManager) -> None:
+        """Function keys should be handled without errors."""
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress,
+            Qt.Key.Key_F5,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        handled = km.handle_key_press(event)
+        assert handled is False

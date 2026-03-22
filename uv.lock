@@ -320,6 +320,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "edge-tts" },
+    { name = "pluggy" },
     { name = "pymupdf" },
     { name = "pyqt6" },
 ]
@@ -332,6 +333,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "edge-tts", specifier = ">=7.2.7" },
+    { name = "pluggy", specifier = ">=1.6.0" },
     { name = "pymupdf", specifier = ">=1.27.2.2" },
     { name = "pyqt6", specifier = ">=6.10.2" },
 ]

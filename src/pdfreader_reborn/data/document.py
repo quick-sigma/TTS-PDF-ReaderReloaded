@@ -1,11 +1,130 @@
+# src/pdfreader_reborn/data/document.py
+
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import fitz
 
 
 class PdfLoadError(Exception):
     """Raised when a PDF file cannot be loaded."""
+
+
+@runtime_checkable
+class PageRenderer(Protocol):
+    """Protocol for page rendering backends.
+
+    Any object that implements render() and extract_text() for a given
+    page number can serve as a renderer. This decouples Page from
+    the specific PDF library used.
+    """
+
+    def render(self, page_number: int, zoom: float) -> bytes:
+        """Render a page to PNG bytes."""
+        ...
+
+    def extract_text(self, page_number: int) -> str:
+        """Extract text from a page."""
+        ...
+
+
+class FitzRenderer:
+    """PyMuPDF-based page renderer.
+
+    Wraps fitz.Document to implement the PageRenderer protocol.
+    All fitz-specific logic is contained here.
+    """
+
+    __slots__ = ("_doc",)
+
+    def __init__(self, doc: fitz.Document) -> None:
+        """Initialize with a fitz document.
+
+        Args:
+            doc: An open fitz.Document instance.
+        """
+        self._doc = doc
+
+    def render(self, page_number: int, zoom: float) -> bytes:
+        """Render a page to PNG bytes using PyMuPDF.
+
+        Args:
+            page_number: Zero-based page index.
+            zoom: Zoom factor for rendering.
+
+        Returns:
+            Raw PNG image bytes.
+        """
+        mat = fitz.Matrix(zoom, zoom)
+        pix = self._doc[page_number].get_pixmap(matrix=mat)
+        return pix.tobytes("png")
+
+    def extract_text(self, page_number: int) -> str:
+        """Extract text from a page using PyMuPDF.
+
+        Args:
+            page_number: Zero-based page index.
+
+        Returns:
+            The extracted text as a string.
+        """
+        text = self._doc[page_number].get_text()
+        return str(text) if text else ""
+
+
+class Page:
+    """Lightweight reference to a single page in a document.
+
+    Delegates rendering and text extraction to a PageRenderer,
+    making it backend-agnostic.
+
+    Attributes:
+        page_number: Zero-based page index.
+        width: Page width in points.
+        height: Page height in points.
+    """
+
+    __slots__ = ("_renderer", "page_number", "width", "height")
+
+    def __init__(
+        self,
+        renderer: PageRenderer,
+        page_number: int,
+        width: float,
+        height: float,
+    ) -> None:
+        """Initialize the page reference.
+
+        Args:
+            renderer: The rendering backend.
+            page_number: Zero-based page index.
+            width: Page width in points.
+            height: Page height in points.
+        """
+        self._renderer = renderer
+        self.page_number = page_number
+        self.width = width
+        self.height = height
+
+    def render(self, zoom: float = 1.0) -> bytes:
+        """Render this page to PNG bytes at the given zoom factor.
+
+        Args:
+            zoom: Zoom factor for rendering.
+
+        Returns:
+            Raw PNG image bytes.
+        """
+        return self._renderer.render(self.page_number, zoom)
+
+    def extract_text(self) -> str:
+        """Extract text content from this page.
+
+        Returns:
+            The extracted text as a string.
+        """
+        return self._renderer.extract_text(self.page_number)
 
 
 class Document(ABC):
@@ -33,7 +152,7 @@ class Document(ABC):
         """Return document metadata as a dictionary."""
 
     @abstractmethod
-    def get_page(self, index: int) -> "Page":
+    def get_page(self, index: int) -> Page:
         """Return a page wrapper for the given index.
 
         Args:
@@ -82,58 +201,11 @@ class Document(ABC):
         self.close()
 
 
-class Page:
-    """Lightweight reference to a single page in a document.
-
-    Attributes:
-        page_number: Zero-based page index.
-        width: Page width in points.
-        height: Page height in points.
-    """
-
-    __slots__ = ("_doc", "page_number", "width", "height")
-
-    def __init__(self, doc: fitz.Document, page_number: int) -> None:
-        """Initialize the page reference.
-
-        Args:
-            doc: The underlying fitz document.
-            page_number: Zero-based page index.
-        """
-        self._doc = doc
-        self.page_number = page_number
-        page = doc[page_number]
-        self.width = page.rect.width
-        self.height = page.rect.height
-
-    def render(self, zoom: float = 1.0) -> bytes:
-        """Render this page to PNG bytes at the given zoom factor.
-
-        Args:
-            zoom: Zoom factor for rendering.
-
-        Returns:
-            Raw PNG image bytes.
-        """
-        mat = fitz.Matrix(zoom, zoom)
-        pix = self._doc[self.page_number].get_pixmap(matrix=mat)
-        return pix.tobytes("png")
-
-    def extract_text(self) -> str:
-        """Extract text content from this page.
-
-        Returns:
-            The extracted text as a string.
-        """
-        text = self._doc[self.page_number].get_text()
-        return str(text) if text else ""
-
-
 class PdfDocument(Document):
     """PDF document adapter using PyMuPDF.
 
-    Loads a PDF into memory and provides page-level access for rendering
-    and text extraction.
+    All fitz-specific logic is delegated to FitzRenderer. The document
+    itself only manages lifecycle and page indexing.
 
     Usage::
 
@@ -154,6 +226,7 @@ class PdfDocument(Document):
         """
         self._path = Path(path)
         self._doc: fitz.Document | None = None
+        self._renderer: FitzRenderer | None = None
 
         if not self._path.exists():
             msg = f"File not found: {self._path}"
@@ -161,6 +234,7 @@ class PdfDocument(Document):
 
         try:
             self._doc = fitz.open(str(self._path))
+            self._renderer = FitzRenderer(self._doc)
         except Exception as exc:
             msg = f"Invalid PDF: {self._path}"
             raise PdfLoadError(msg) from exc
@@ -186,19 +260,26 @@ class PdfDocument(Document):
             index: Zero-based page index.
 
         Returns:
-            A Page object for the requested page.
+            A Page object backed by FitzRenderer.
 
         Raises:
             RuntimeError: If the document is closed.
             IndexError: If the index is out of range.
         """
-        if self._doc is None:
+        if self._doc is None or self._renderer is None:
             msg = "Document is closed"
             raise RuntimeError(msg)
         if index < 0 or index >= len(self._doc):
             msg = f"Page index {index} out of range (0-{len(self._doc) - 1})"
             raise IndexError(msg)
-        return Page(self._doc, index)
+
+        fitz_page = self._doc[index]
+        return Page(
+            renderer=self._renderer,
+            page_number=index,
+            width=fitz_page.rect.width,
+            height=fitz_page.rect.height,
+        )
 
     def render_page(self, index: int, zoom: float = 1.0) -> bytes:
         """Render a page and return raw PNG bytes.
@@ -223,10 +304,11 @@ class PdfDocument(Document):
             The extracted text as a string.
         """
         page = self.get_page(index)
-        return str(page.extract_text())
+        return page.extract_text()
 
     def close(self) -> None:
         """Close the document and release resources."""
         if self._doc is not None:
             self._doc.close()
             self._doc = None
+            self._renderer = None

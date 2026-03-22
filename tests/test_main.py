@@ -23,6 +23,9 @@ def test_new_architecture_modules_importable() -> None:
     from pdfreader_reborn.ui.toolbar import Toolbar, NavigationToolbar
     from pdfreader_reborn.ui.viewer import Viewer, PDFViewer
     from pdfreader_reborn.data.document import Document, PdfDocument
+    from pdfreader_reborn.kernel import Kernel
+    from pdfreader_reborn.kernel.hooks import ToolbarHooks
+    from pdfreader_reborn.plugins import OpenFilePlugin
 
     assert Icon is not None
     assert SVGIcon is not None
@@ -35,3 +38,6 @@ def test_new_architecture_modules_importable() -> None:
     assert PDFViewer is not None
     assert Document is not None
     assert PdfDocument is not None
+    assert Kernel is not None
+    assert ToolbarHooks is not None
+    assert OpenFilePlugin is not None

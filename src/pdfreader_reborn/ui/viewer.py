@@ -1,5 +1,8 @@
+# src/pdfreader_reborn/ui/viewer.py
+
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Queue, Empty
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
@@ -36,14 +39,17 @@ class PageRenderTask:
 class RenderWorker(QThread):
     """Background thread that renders PDF pages off the UI thread.
 
-    Pages are queued via ``request_page()`` and rendered asynchronously.
-    When a page is ready, the ``page_ready`` signal is emitted.
+    Uses a thread-safe Queue to receive page requests. The worker sleeps
+    efficiently when idle — no busy-waiting or polling loops.
 
     Attributes:
         page_ready: Signal emitted with (page_number, pixmap) when done.
     """
 
     page_ready = pyqtSignal(int, QPixmap)
+
+    QUEUE_TIMEOUT: float = 0.1
+    """Seconds to wait for a queue item before checking _running flag."""
 
     def __init__(self, doc: PdfDocument, zoom: float = 1.5) -> None:
         """Initialize the render worker.
@@ -55,26 +61,28 @@ class RenderWorker(QThread):
         super().__init__()
         self._doc = doc
         self._zoom = zoom
-        self._queue: list[int] = []
+        self._queue: Queue[int] = Queue()
         self._running = True
+        self._pending: set[int] = set()
 
     def request_page(self, page_number: int) -> None:
-        """Queue a page for rendering.
+        """Queue a page for rendering. Thread-safe, deduplicates requests.
 
         Args:
             page_number: Zero-based page index to render.
         """
-        if page_number not in self._queue:
-            self._queue.append(page_number)
+        if page_number not in self._pending:
+            self._pending.add(page_number)
+            self._queue.put(page_number)
 
     def run(self) -> None:
-        """Main render loop. Processes queued pages until stopped."""
+        """Main render loop. Blocks on queue, no busy-waiting."""
         while self._running:
-            if not self._queue:
-                self.msleep(16)
+            try:
+                page_num = self._queue.get(timeout=self.QUEUE_TIMEOUT)
+            except Empty:
                 continue
 
-            page_num = self._queue.pop(0)
             try:
                 img_bytes = self._doc.render_page(page_num, zoom=self._zoom)
                 image = QImage.fromData(img_bytes, "PNG")
@@ -82,6 +90,8 @@ class RenderWorker(QThread):
                 self.page_ready.emit(page_num, pixmap)
             except Exception:
                 pass
+            finally:
+                self._pending.discard(page_num)
 
     def stop(self) -> None:
         """Stop the render loop and wait for the thread to finish."""
@@ -265,7 +275,8 @@ class PDFViewer(Viewer, QScrollArea):
 
         start = max(0, min(visible) - self.CACHE_BEHIND) if visible else 0
         end = min(
-            len(self._labels), (max(visible) + self.CACHE_AHEAD + 1) if visible else 0
+            len(self._labels),
+            (max(visible) + self.CACHE_AHEAD + 1) if visible else 0,
         )
 
         for i in range(start, end):
@@ -302,6 +313,7 @@ class PDFViewer(Viewer, QScrollArea):
     def close(self) -> None:
         """Close the document and release resources."""
         self._cleanup_worker()
+        self._cache.clear()
         if self._doc is not None:
             self._doc.close()
             self._doc = None
