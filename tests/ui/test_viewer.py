@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
@@ -135,15 +135,17 @@ class TestPDFViewerZoom:
     def test_set_zoom_updates_label_sizes_immediately(
         self, qapp: QApplication, sample_pdf: Path
     ) -> None:
-        """set_zoom should set label heights to expected values."""
+        """set_zoom should set label dimensions to expected values."""
         viewer = PDFViewer()
         viewer.load_document(sample_pdf)
 
         viewer.set_zoom(2.0)
+        qapp.processEvents()
+
         for i, label in enumerate(viewer._labels):
             page = viewer._doc.get_page(i)
-            expected = int(page.height * 2.0)
-            assert label.minimumHeight() == expected
+            assert label.height() == int(page.height * 2.0)
+            assert label.width() == int(page.width * 2.0)
 
         viewer.close()
 
@@ -265,13 +267,15 @@ class TestApplyZoomUI:
     def test_apply_zoom_ui_updates_label_heights(
         self, qapp: QApplication, sample_pdf: Path
     ) -> None:
-        """Label minimum heights should reflect the new zoom."""
+        """Label dimensions should reflect the new zoom."""
         viewer = PDFViewer()
         viewer.load_document(sample_pdf)
         viewer._apply_zoom_ui(3.0, QPoint(0, 0))
+        qapp.processEvents()
         for i, label in enumerate(viewer._labels):
             page = viewer._doc.get_page(i)
-            assert label.minimumHeight() == int(page.height * 3.0)
+            assert label.height() == int(page.height * 3.0)
+            assert label.width() == int(page.width * 3.0)
         viewer.close()
 
     def test_apply_zoom_ui_no_doc_does_not_raise(self, qapp: QApplication) -> None:
@@ -393,6 +397,106 @@ class TestSetZoomAnimate:
 
         viewer.set_zoom(2.0, anchor=None, animate=False)
         assert viewer.zoom == 2.0
+        viewer.close()
+
+
+class TestSmoothZoomRendering:
+    """Tests that verify correct rendering behavior during animated zoom."""
+
+    def test_labels_have_scaled_contents(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """Labels should have scaledContents enabled for smooth zoom."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        for label in viewer._labels:
+            assert label.hasScaledContents()
+        viewer.close()
+
+    def test_labels_use_fixed_size_not_minimum(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """After set_zoom, labels should use fixed size (not just minimum)."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.set_zoom(2.0)
+        qapp.processEvents()
+
+        for i, label in enumerate(viewer._labels):
+            page = viewer._doc.get_page(i)
+            expected_h = int(page.height * 2.0)
+            expected_w = int(page.width * 2.0)
+            # With setFixedSize, height() and width() match the expected values.
+            assert label.height() == expected_h
+            assert label.width() == expected_w
+        viewer.close()
+
+    def test_animation_scales_pixmaps_during_zoom(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """_apply_zoom_pixmaps should scale cached pixmaps to new size."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        # Render page 0 at the current zoom so the cache has it.
+        viewer.set_zoom(1.5, animate=False)
+        assert viewer._cache is not None
+        original = viewer._cache.get(0)
+        assert original is not None
+
+        # Now simulate what the animator does at 2.5x:
+        viewer._zoom = 2.5
+        viewer._apply_zoom_pixmaps(2.5)
+        qapp.processEvents()
+
+        page0 = viewer._doc.get_page(0)
+        expected_h = int(page0.height * 2.5)
+        expected_w = int(page0.width * 2.5)
+        assert viewer._labels[0].pixmap().height() == expected_h
+        assert viewer._labels[0].pixmap().width() == expected_w
+
+        # The original cached pixmap must remain unchanged.
+        assert original.height() == int(page0.height * 1.5)
+        viewer.close()
+
+    def test_finish_zoom_replaces_scaled_with_hires(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """_finish_zoom should re-render at the current zoom."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        viewer.resize(800, 600)
+        qapp.processEvents()
+
+        # Simulate the end of an animation: zoom is 2.0, labels still at 1.5.
+        viewer._zoom = 2.0
+        if viewer._adapter is not None:
+            viewer._adapter.zoom = 2.0
+        viewer._update_label_sizes()
+        qapp.processEvents()
+
+        viewer._finish_zoom()
+        qapp.processEvents()
+
+        assert viewer._cache is not None
+        pixmap = viewer._cache.get(0)
+        assert pixmap is not None
+
+        page0 = viewer._doc.get_page(0)
+        assert pixmap.height() == int(page0.height * 2.0)
+        assert pixmap.width() == int(page0.width * 2.0)
+        viewer.close()
+
+    def test_layout_is_horizontally_centered(
+        self, qapp: QApplication, sample_pdf: Path
+    ) -> None:
+        """Container layout should include horizontal centering."""
+        viewer = PDFViewer()
+        viewer.load_document(sample_pdf)
+        alignment = viewer._layout.alignment()
+        assert alignment & Qt.AlignmentFlag.AlignHCenter
         viewer.close()
 
 

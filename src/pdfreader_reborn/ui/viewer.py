@@ -176,10 +176,11 @@ class Viewer:
 class _ZoomAnimator:
     """Smoothly interpolate zoom between current and target values.
 
-    Uses a QTimer at ~60 fps to step through intermediate zoom values.
-    On each step the viewer's label heights and scroll position are
-    updated for a fluid visual effect.  When the animation settles the
-    expensive page re-rendering is triggered once.
+    Uses a QTimer at ~60 fps.  During the animation only **pixmaps**
+    are scaled in-place (no label-size changes → no layout jitter).
+    Scroll is updated arithmetically so the anchor stays fixed.
+    When the animation settles the labels snap to their final size
+    and the pages are re-rendered at full quality.
 
     Rapid wheel events update the *target* so the animation adapts
     in-flight without restarting from scratch (coalescence).
@@ -198,6 +199,11 @@ class _ZoomAnimator:
         self._target_zoom: float = 0.0
         self._anchor: QPoint | None = None
         self._frame: int = 0
+
+        # Captured on the first frame so scroll stays stable.
+        self._initial_scroll: int = 0
+        self._anchor_viewport_y: int = 0
+        self._anchor_doc_y: float = 0.0
 
     # ── public API ──────────────────────────────────────────
 
@@ -243,6 +249,14 @@ class _ZoomAnimator:
 
     def _step(self) -> None:
         """Advance one animation frame."""
+        # Capture starting state on the very first frame.
+        if self._frame == 0:
+            scroll = self._viewer.verticalScrollBar().value()
+            anchor_y = self._anchor.y() if self._anchor is not None else 0
+            self._initial_scroll = scroll
+            self._anchor_viewport_y = anchor_y
+            self._anchor_doc_y = scroll + anchor_y
+
         self._frame += 1
         progress = min(1.0, self._frame / _ZOOM_STEPS)
 
@@ -252,11 +266,20 @@ class _ZoomAnimator:
 
         if progress >= 1.0 or abs(zoom - self._target_zoom) < _ZOOM_MIN_DELTA:
             self._timer.stop()
+            # Snap: resize labels + scroll + re-render.
             self._viewer._apply_zoom_ui(self._target_zoom, self._anchor)
             self._viewer._finish_zoom()
             return
 
-        self._viewer._apply_zoom_ui(zoom, self._anchor)
+        # During animation: scale pixmaps only (no layout changes).
+        self._viewer._zoom = zoom
+        self._viewer._apply_zoom_pixmaps(zoom)
+
+        # Update scroll arithmetically (no label.height() calls).
+        ratio = zoom / self._start_zoom if self._start_zoom else 1.0
+        new_doc_y = self._anchor_doc_y * ratio
+        new_scroll = int(new_doc_y) - self._anchor_viewport_y
+        self._viewer.verticalScrollBar().setValue(max(0, new_scroll))
 
 
 class PDFViewer(Viewer, QScrollArea):
@@ -296,7 +319,9 @@ class PDFViewer(Viewer, QScrollArea):
         self._layout = QVBoxLayout(self._container)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(4)
-        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._layout.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter
+        )
         self.setWidget(self._container)
 
         self._doc: PdfDocument | None = None
@@ -330,10 +355,13 @@ class PDFViewer(Viewer, QScrollArea):
         for i in range(self._doc.page_count):
             label = QLabel(t("viewer.page_loading", page=i + 1))
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setMinimumHeight(200)
+            label.setScaledContents(True)
             label.setStyleSheet("background: #f0f0f0; border: 1px solid #ccc;")
             self._layout.addWidget(label)
             self._labels.append(label)
+
+        # Pre-compute exact label sizes so the layout is stable from the start.
+        self._update_label_sizes()
 
         # Seed the cache around page 0.
         self._cache.focus = 0
@@ -464,6 +492,10 @@ class PDFViewer(Viewer, QScrollArea):
     def _apply_pixmap(self, page_number: int, pixmap: QPixmap) -> None:
         """Apply a rendered pixmap to the corresponding label.
 
+        The label size is controlled by ``_update_label_sizes`` so we
+        only set the image here — no size changes that could cause
+        visual jitter.
+
         Args:
             page_number: Zero-based page index.
             pixmap: The rendered page image.
@@ -472,7 +504,6 @@ class PDFViewer(Viewer, QScrollArea):
             return
         label = self._labels[page_number]
         label.setPixmap(pixmap)
-        label.setMinimumHeight(pixmap.height())
         label.setText("")
 
     # ── Zoom ─────────────────────────────────────────────────
@@ -519,31 +550,55 @@ class PDFViewer(Viewer, QScrollArea):
             self._finish_zoom()
 
     def _apply_zoom_ui(self, zoom: float, anchor: QPoint | None) -> None:
-        """Fast label-height + scroll update (no rendering).
+        """Snap labels to final size and update scroll.
 
-        Called on every animation frame.  Keeps the document point
-        under *anchor* visually stationary.
+        Called at the **end** of an animation or immediately when
+        ``animate=False``.  Not called during animation frames.
         """
         if self._doc is None or not self._labels:
             self._zoom = zoom
             return
 
-        # --- snapshot the anchor point in document space ----------
         scroll_pos = self.verticalScrollBar().value()
         anchor_y = anchor.y() if anchor is not None else 0
         doc_y = scroll_pos + anchor_y
 
         anchor_page, anchor_fraction = self._compute_anchor(doc_y)
 
-        # --- apply new zoom to labels -----------------------------
         self._zoom = zoom
         if self._adapter is not None:
             self._adapter.zoom = zoom
         self._update_label_sizes()
 
-        # --- restore scroll so the anchor stays put ---------------
         new_scroll = self._scroll_to_anchor(anchor_page, anchor_fraction, anchor_y)
         self.verticalScrollBar().setValue(max(0, new_scroll))
+
+    def _apply_zoom_pixmaps(self, zoom: float) -> None:
+        """Scale cached pixmaps in-place for the current animation frame.
+
+        This is fast because it only touches the visible labels'
+        pixmaps — **no label-size changes and no layout recalculation**.
+        """
+        if self._cache is None or self._doc is None or not self._labels:
+            return
+
+        vis_start, vis_end = self._get_visible_range()
+
+        for i in range(vis_start, min(vis_end, len(self._labels))):
+            original = self._cache.get(i)
+            if original is None:
+                continue
+            label = self._labels[i]
+            page = self._doc.get_page(i)
+            w = int(page.width * zoom)
+            h = int(page.height * zoom)
+            scaled = original.scaled(
+                w,
+                h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
 
     def _finish_zoom(self) -> None:
         """Re-render visible pages at the final zoom level.
@@ -608,13 +663,19 @@ class PDFViewer(Viewer, QScrollArea):
         return y - viewport_y
 
     def _update_label_sizes(self) -> None:
-        """Pre-compute and set expected label heights at current zoom."""
+        """Pre-compute and set exact label dimensions at current zoom.
+
+        Uses ``setFixedSize`` (width + height) so the aspect ratio is
+        preserved during animated zoom transitions.
+        """
         if self._doc is None:
             return
         for i, label in enumerate(self._labels):
             if i < self._doc.page_count:
                 page = self._doc.get_page(i)
-                label.setMinimumHeight(int(page.height * self._zoom))
+                w = int(page.width * self._zoom)
+                h = int(page.height * self._zoom)
+                label.setFixedSize(w, h)
 
     @property
     def zoom(self) -> float:
